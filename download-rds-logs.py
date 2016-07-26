@@ -1,70 +1,98 @@
 #!/usr/bin/env python
 
 import logging
-from optparse import OptionParser
+import argparse
 import os
-from boto import rds2
-import sys
+import boto3
 import re
 import time
 import math
 
-AWS_REGIONS = ["us-east-1", "us-west-1", "us-west-2", "eu-west-1", \
-    "eu-central-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",\
-    "sa-east-1"]
+PROGNAME = "download-rds-logs.py"
+AWS_REGIONS = [
+    "us-east-1", "us-west-1", "us-west-2",
+    "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+    "ap-northeast-1", "ap-northeast-2",
+    "eu-west-1", "eu-central-1",
+    "sa-east-1"
+]
+
+
+def create_parser(program_name):
+    parser = argparse.ArgumentParser(prog=program_name)
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true", dest="debug",
+        help="Turn on debug logging",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true", dest="quiet",
+        help="turn off all logging",
+    )
+    parser.add_argument(
+        "-i", "--instance",
+        action="store", dest="instance", required=True,
+        help="instance name",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        action="store", dest="output_dir",
+        default="./",
+        help="output directory",
+    )
+    parser.add_argument(
+        "-r", "--region",
+        action="store", dest="region",
+        default="us-east-1", choices=AWS_REGIONS,
+        help="AWS region",
+    )
+    parser.add_argument(
+        "-m", "--match",
+        action="store", dest="logfile_match",
+        help="Only download logs matching regexp",
+    )
+    parser.add_argument(
+        "-l", "--lines", action="store",
+        type=int, dest="lines",
+        default=1000,
+        help="Initial number of lines to request per chunk. "
+        "Number of lines will be reduced if logs get truncated.",
+    )
+    parser.add_argument(
+        "-b", "--backoff",
+        action="store", type=int, dest="backoff",
+        default=10,
+        help="Max times to sleep after exponential backoff due to throttling ",
+    )
+    return parser
+
 
 def _main():
-    usage = "usage: %prog -i my-instance-id"
-    parser = OptionParser(usage=usage,
-                          description="")
-    parser.add_option("-d", "--debug", action="store_true", dest="debug",
-                      help="Turn on debug logging")
-    parser.add_option("-q", "--quiet", action="store_true", dest="quiet",
-                      help="turn off all logging")
-    parser.add_option("-i", "--instance", action="store", dest="instance",
-                      default=None,
-                      help="instance name")
-    parser.add_option("-o", "--output", action="store", dest="output_dir",
-                      default="./",
-                      help="output directory")
-    parser.add_option("-r", "--region", action="store", dest="region",
-        default="us-east-1",
-        choices=AWS_REGIONS,
-        help="AWS region")
-    parser.add_option("-m", "--match", action="store", dest="logfile_match",
-        help="Only download logs matching regexp")
-    parser.add_option("-l", "--lines", action="store", type="int", dest="lines",
-        help="Initial number of lines to request per chunk. Number of lines will be reduced if logs get truncated.", default=1000)
-    parser.add_option("-b", "--backoff", action="store", type="int", dest="backoff",
-        help="Max times to sleep after exponential backoff due to throttling ", default=10)
+    parser = create_parser(PROGNAME)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else (logging.ERROR if args.quiet else logging.INFO))
 
-    (options, args) = parser.parse_args()
- 
-    logging.basicConfig(level=logging.DEBUG if options.debug else
-    (logging.ERROR if options.quiet else logging.INFO))
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
 
-    if not options.instance:
-        logging.error("Instance parameter is required")
-        sys.exit(-1)
-
-    if not os.path.exists(options.output_dir):
-        os.mkdir(options.output_dir)
-
-
-    connection = rds2.connect_to_region(options.region)
-    response = connection.describe_db_log_files(options.instance)
-    logfiles = response['DescribeDBLogFilesResponse']['DescribeDBLogFilesResult']['DescribeDBLogFiles']
-    backoff = options.backoff
-    for log in logfiles:
+    client = boto3.client(
+        "rds",
+        region_name=args.region,
+    )
+    response = client.describe_db_log_files(
+        DBInstanceIdentifier=args.instance
+    )
+    for log in response['DescribeDBLogFiles']:
         logging.debug(log)
         logfilename = log['LogFileName']
-        lines = options.lines
+        lines = args.lines
 
-        if options.logfile_match is not None and not re.search(options.logfile_match, logfilename):
+        if args.logfile_match is not None and not re.search(args.logfile_match, logfilename):
             logging.info("Skipping " + logfilename)
             continue
 
-        destination = os.path.join(options.output_dir, os.path.basename(logfilename))
+        destination = os.path.join(args.output_dir, os.path.basename(logfilename))
 
         if os.path.exists(destination):
             statinfo = os.stat(destination)
@@ -81,26 +109,29 @@ def _main():
             more_data = True
             marker = "0"
             sleepcount = 0
-            while more_data and sleepcount < backoff:
+            while more_data and sleepcount < args.backoff:
                 logging.info("requesting %s marker:%s chunk:%i" % (logfilename, marker, chunk))
                 try:
-                    response = connection.download_db_log_file_portion(options.instance, logfilename,
-                        marker=marker, number_of_lines=lines)
+                    result = client.download_db_log_file_portion(
+                        DBInstanceIdentifier=args.instance,
+                        LogFileName=logfilename,
+                        Marker=marker,
+                        NumberOfLines=lines,
+                    )
                 except:
-                    sleeptime=math.pow(2,sleepcount)
-                    logging.info("sleep #%s (%s seconds) due to failure" % (sleepcount, sleeptime))
+                    sleeptime = math.pow(2, sleepcount)
+                    logging.warning("sleep #%s (%s seconds) due to failure" % (sleepcount, sleeptime))
                     time.sleep(sleeptime)
                     sleepcount += 1
                     continue
                 sleepcount = 0
-                result = response['DownloadDBLogFilePortionResponse']['DownloadDBLogFilePortionResult']
                 logging.info("AdditionalDataPending:%s Marker:%s" % (str(result['AdditionalDataPending']), result['Marker']))
 
                 if 'LogFileData' in result and result['LogFileData'] is not None:
                     if result['LogFileData'].endswith("[Your log message was truncated]\n"):
                         logging.info("Log segment was truncated")
-                        if lines > options.lines * 0.1:
-                            lines -= int(options.lines * 0.1)
+                        if lines > args.lines * 0.1:
+                            lines -= int(args.lines * 0.1)
                             logging.info("retrying with %i lines" % lines)
                             continue
 
@@ -115,7 +146,7 @@ def _main():
                 del result['LogFileData']
                 logging.debug(result)
 
-            if sleepcount == backoff:
+            if sleepcount == args.backoff:
                 logging.error("Error downloading file:%s - too many errors from AWS " % (logfilename))
 
 
