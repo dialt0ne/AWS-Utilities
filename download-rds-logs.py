@@ -80,9 +80,22 @@ def _main():
         "rds",
         region_name=args.region,
     )
-    response = client.describe_db_log_files(
-        DBInstanceIdentifier=args.instance
-    )
+    sleepcount = 0
+    while sleepcount < args.backoff:
+        try:
+            response = client.describe_db_log_files(
+                DBInstanceIdentifier=args.instance
+            )
+            break
+        except:
+            sleeptime = math.pow(2, sleepcount)
+            logging.warning("sleep #%s (%s seconds) due to failure" % (sleepcount, sleeptime))
+            time.sleep(sleeptime)
+            sleepcount += 1
+            continue
+    if sleepcount == args.backoff:
+        logging.error("Error describing log files for instance: %s" % (args.instance))
+        return
     for log in response['DescribeDBLogFiles']:
         logging.debug(log)
         logfilename = log['LogFileName']
