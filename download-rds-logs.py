@@ -144,7 +144,7 @@ def _main():
                     if result['LogFileData'].endswith("[Your log message was truncated]\n"):
                         logging.info("Log segment was truncated")
                         if lines > args.lines * 0.1:
-                            lines -= int(args.lines * 0.1)
+                            lines -= int(10)
                             logging.info("retrying with %i lines" % lines)
                             continue
 
